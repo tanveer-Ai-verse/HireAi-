@@ -573,12 +573,6 @@ def build_analysis_pdf(analysis: dict, opt_cv: str) -> bytes:
     if isinstance(out, str):
         return out.encode("latin-1")
     return bytes(out)
-        # ... (all your existing code above) ...
-    # ── Page 2: Optimized CV ──
-    # ... (all your existing code for Page 2) ...
-
-    # REPLACE THE OLD RETURN BLOCK WITH THIS:
-    return pdf.output()
     
 
 
