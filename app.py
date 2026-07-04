@@ -407,7 +407,7 @@ def build_analysis_pdf(analysis: dict, opt_cv: str) -> bytes:
     pdf.set_xy(10, 8)
     pdf.set_font("Helvetica", "B", 20)
     pdf.set_text_color(200, 154, 240)
-    pdf.cell(0, 14, "HireAi — Resume Analysis Report", ln=True)
+    pdf.cell(0, 14, "HireAi - Resume Analysis Report", ln=True)
 
     pdf.set_xy(10, 22)
     pdf.set_font("Helvetica", "", 9)
