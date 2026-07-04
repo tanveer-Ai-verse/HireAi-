@@ -18,12 +18,6 @@ from groq import Groq
 from fpdf import FPDF
 import unicodedata
 
-def clean_text(text):
-    if not isinstance(text, str):
-        text = str(text)
-    # This removes/replaces smart quotes, em-dashes, and other special 
-    # characters with their closest standard ASCII equivalents.
-    return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
     
 
 # ─────────────────────────────────────────────
@@ -579,6 +573,13 @@ def build_analysis_pdf(analysis: dict, opt_cv: str) -> bytes:
     if isinstance(out, str):
         return out.encode("latin-1")
     return bytes(out)
+        # ... (all your existing code above) ...
+    # ── Page 2: Optimized CV ──
+    # ... (all your existing code for Page 2) ...
+
+    # REPLACE THE OLD RETURN BLOCK WITH THIS:
+    return pdf.output()
+    
 
 
 # ─────────────────────────────────────────────
