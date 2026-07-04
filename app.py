@@ -16,6 +16,15 @@ import docx
 import pandas as pd
 from groq import Groq
 from fpdf import FPDF
+import unicodedata
+
+def clean_text(text):
+    if not isinstance(text, str):
+        text = str(text)
+    # This removes/replaces smart quotes, em-dashes, and other special 
+    # characters with their closest standard ASCII equivalents.
+    return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
+    
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
