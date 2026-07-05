@@ -917,7 +917,7 @@ def render_single_results(analysis: dict, resume_text: str, jd_text: str, jd_tit
     st.text_area("ATS-Optimized CV (copy or download)", opt_cv, height=400)
 
     # ── PDF Export ──
-    def build_analysis_pdf(analysis, opt_cv):
+def build_analysis_pdf(analysis, opt_cv):
     from fpdf import FPDF
     import io
 
