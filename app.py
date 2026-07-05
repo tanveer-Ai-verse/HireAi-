@@ -283,11 +283,12 @@ def init_session():
         "saved_jobs": [],
         "current_tab": "Analyzer",
         "users_db": {},
-        "batch_results": [],       # list of {filename, analysis} dicts from batch run
+        "batch_results": [],
         "last_single_analysis": None,
         "last_single_resume_text": "",
-        "last_single_opt_cv": "",
+        "last_single_opt_cv": "",       # cached to avoid regenerating on rerun
         "last_single_jd_title": "",
+        "last_single_jd_text": "",      # store JD so PDF rebuild uses same text
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -336,6 +337,7 @@ def clean_text(text: str) -> str:
     """Sanitize text for FPDF (latin-1 safe, no UnicodeEncodeError)."""
     if not isinstance(text, str):
         text = str(text)
+    # Strip characters outside latin-1 range, replacing them with '?'
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
@@ -356,7 +358,7 @@ def extract_text(file_bytes: bytes, file_name: str) -> str:
     return file_bytes.decode("utf-8", errors="ignore")
 
 
-def extract_from_zip(zip_bytes: bytes) -> list[dict]:
+def extract_from_zip(zip_bytes: bytes) -> list:
     """
     Open a ZIP archive and extract text from every PDF/DOCX/TXT inside.
     Returns a list of {filename, text} dicts.
@@ -366,7 +368,6 @@ def extract_from_zip(zip_bytes: bytes) -> list[dict]:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
             for name in z.namelist():
                 lower = name.lower()
-                # skip macOS metadata and directories
                 if name.startswith("__MACOSX") or name.endswith("/"):
                     continue
                 if not any(lower.endswith(ext) for ext in (".pdf", ".docx", ".txt")):
@@ -406,21 +407,18 @@ def parse_json(text: str):
     """Extract and parse JSON from LLM output, with multiple fallback strategies."""
     if text.startswith("[API_ERROR"):
         return None
-    # Try fenced code block first
     m = re.search(r"```json\s*([\s\S]+?)```", text)
     if m:
         try:
             return json.loads(m.group(1))
         except Exception:
             pass
-    # Try raw JSON object / array
     s = text.find("{") if "{" in text else text.find("[")
     if s != -1:
         try:
             return json.loads(text[s:])
         except Exception:
             pass
-    # Last resort: parse as-is
     try:
         return json.loads(text)
     except Exception:
@@ -476,179 +474,120 @@ def score_color(s: int) -> str:
 
 
 # ─────────────────────────────────────────────
-# PDF EXPORT — SINGLE CANDIDATE
+# PDF LAYOUT CONSTANTS
 # ─────────────────────────────────────────────
-def build_analysis_pdf(analysis: dict, opt_cv: str) -> bytes:
-    """Generate a polished PDF report. All strings pass through clean_text()."""
+# A4 page = 210 mm wide. With PDF_MARGIN on each side, printable width = PDF_PW.
+PDF_MARGIN: float = 15.0
+PDF_PW: float = 210.0 - 2 * PDF_MARGIN   # 180 mm printable width
+
+
+# ─────────────────────────────────────────────
+# SHARED PDF HELPER FUNCTIONS
+# ─────────────────────────────────────────────
+def _pdf_new(auto_break_margin: float = PDF_MARGIN) -> tuple:
+    """
+    Create a new FPDF instance with consistent margins.
+    Returns (pdf, printable_width).
+    Must call pdf.add_page() after this.
+    """
     pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
+    # Set margins BEFORE add_page so every page inherits them
+    pdf.set_margins(PDF_MARGIN, PDF_MARGIN, PDF_MARGIN)
+    pdf.set_auto_page_break(auto=True, margin=auto_break_margin)
+    pw = pdf.w - pdf.l_margin - pdf.r_margin  # confirmed printable width
+    return pdf, pw
 
-    # ── Page 1: Analysis Report ──
-    pdf.add_page()
 
-    # Header bar
+def _pdf_page_header(pdf: FPDF, pw: float, title: str, subtitle: str) -> None:
+    """
+    Draw the full-width dark header bar at the top of a page, then advance
+    the cursor below it. Safe to call immediately after pdf.add_page().
+    """
+    # Dark background bar (drawn absolutely — intentionally outside margin)
     pdf.set_fill_color(15, 8, 59)
     pdf.rect(0, 0, 210, 30, "F")
-    pdf.set_xy(10, 8)
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.set_text_color(200, 154, 240)
-    pdf.cell(0, 14, clean_text("HireAi -- Resume Analysis Report"), ln=True)
 
-    pdf.set_xy(10, 22)
+    # Title inside the bar
+    pdf.set_xy(pdf.l_margin, 8)
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_text_color(200, 154, 240)
+    pdf.cell(pw, 12, clean_text(title), ln=True)
+
+    # Subtitle inside the bar
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(112, 96, 160)
-    pdf.cell(0, 6, clean_text(f"Generated: {datetime.now().strftime('%B %d, %Y at %H:%M')}"), ln=True)
+    pdf.cell(pw, 6, clean_text(subtitle), ln=True)
 
-    pdf.ln(10)
+    # Advance below the header band
+    pdf.set_y(38)
 
-    # Candidate Info
-    pdf.set_font("Helvetica", "B", 13)
+
+def _pdf_section_header(pdf: FPDF, pw: float, title: str) -> None:
+    """
+    Draw a coloured section-title row followed by a thin purple rule.
+    Cursor is ready for body content on return.
+    """
+    pdf.set_x(pdf.l_margin)
+    pdf.set_font("Helvetica", "B", 12)
     pdf.set_text_color(200, 154, 240)
-    pdf.cell(0, 8, clean_text("Candidate Profile"), ln=True)
+    pdf.cell(pw, 8, clean_text(title), ln=True)
     pdf.set_draw_color(84, 22, 181)
     pdf.set_line_width(0.4)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
     pdf.ln(3)
 
-    fields = [
-        ("Name", "candidate_name"), ("Email", "email"), ("Phone", "phone"),
-        ("Location", "location"), ("LinkedIn", "linkedin"),
-        ("Years of Experience", "years_experience"),
-        ("Current Title", "current_title"), ("Education", "education"),
-    ]
+
+def _pdf_kv_row(pdf: FPDF, pw: float,
+                label: str, value: str,
+                lbl_w: float = 55.0) -> None:
+    """
+    Render a key/value row. Long values are truncated to one cell (safe for
+    fields like Name, Email, LinkedIn, etc.). The value column fills the rest
+    of the printable width.
+    """
+    val_w = pw - lbl_w
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "", 10)
-    for label, key in fields:
-        val = analysis.get(key, "-") or "-"
-        pdf.set_text_color(112, 96, 160)
-        pdf.cell(55, 7, clean_text(f"  {label}:"), ln=False)
-        pdf.set_text_color(232, 234, 240)
-        pdf.cell(0, 7, clean_text(str(val)), ln=True)
+    pdf.set_text_color(112, 96, 160)
+    pdf.cell(lbl_w, 7, clean_text(f"  {label}:"), ln=False)
+    pdf.set_text_color(232, 234, 240)
+    # Truncate at val_w chars worth — very long URLs, etc. won't overflow
+    safe_val = clean_text(str(value or "-"))[:120]
+    pdf.cell(val_w, 7, safe_val, ln=True)
 
-    pdf.ln(6)
 
-    # Scores
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.set_text_color(200, 154, 240)
-    pdf.cell(0, 8, clean_text("ATS Score Summary"), ln=True)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(4)
-
-    score_items = [
-        ("Overall ATS Score", "ats_score"),
-        ("Keyword Match", "keyword_match_score"),
-        ("Format Score", "format_score"),
-        ("Readability Score", "readability_score"),
-    ]
+def _pdf_score_row(pdf: FPDF, pw: float,
+                   label: str, value: int,
+                   lbl_w: float = 95.0) -> None:
+    """Render one score label + coloured value row."""
+    val_w = pw - lbl_w
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "", 11)
-    for label, key in score_items:
-        val = analysis.get(key, 0)
-        pdf.set_text_color(112, 96, 160)
-        pdf.cell(90, 8, clean_text(f"  {label}"), ln=False)
-        if val >= 75:
-            pdf.set_text_color(100, 220, 80)
-        elif val >= 50:
-            pdf.set_text_color(220, 200, 70)
-        else:
-            pdf.set_text_color(220, 80, 100)
-        pdf.cell(0, 8, clean_text(f"{val} / 100"), ln=True)
+    pdf.set_text_color(112, 96, 160)
+    pdf.cell(lbl_w, 8, clean_text(f"  {label}"), ln=False)
+    if value >= 75:
+        pdf.set_text_color(100, 220, 80)
+    elif value >= 50:
+        pdf.set_text_color(220, 200, 70)
+    else:
+        pdf.set_text_color(220, 80, 100)
+    pdf.cell(val_w, 8, clean_text(f"{value} / 100"), ln=True)
 
-    pdf.ln(4)
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.set_text_color(160, 200, 100)
-    rec = analysis.get("overall_recommendation", "")
-    pdf.cell(0, 8, clean_text(f"  Recommendation: {rec}"), ln=True)
 
-    pdf.ln(3)
-    pdf.set_font("Helvetica", "I", 10)
-    pdf.set_text_color(180, 170, 210)
-    summary = analysis.get("summary", "")
-    pdf.multi_cell(0, 6, clean_text(f"  {summary}"))
+def _pdf_multiline(pdf: FPDF, pw: float,
+                   text: str, h: float = 6,
+                   indent: str = "  ") -> None:
+    """
+    Wrap text inside the printable width. Always resets x to l_margin first
+    so we never trigger 'Not enough horizontal space'.
+    """
+    pdf.set_x(pdf.l_margin)
+    pdf.multi_cell(pw, h, clean_text(f"{indent}{text}"))
 
-    pdf.ln(6)
 
-    # Keywords
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.set_text_color(200, 154, 240)
-    pdf.cell(0, 8, clean_text("Keyword Analysis"), ln=True)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(3)
-
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.set_text_color(100, 220, 80)
-    pdf.cell(0, 7, clean_text("  Matched Keywords:"), ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(232, 234, 240)
-    matched = ", ".join(analysis.get("matched_keywords", []))
-    pdf.multi_cell(0, 6, clean_text(f"  {matched or 'None identified'}"))
-
-    pdf.ln(2)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.set_text_color(220, 80, 100)
-    pdf.cell(0, 7, clean_text("  Missing Keywords:"), ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(232, 234, 240)
-    missing = ", ".join(analysis.get("missing_keywords", []))
-    pdf.multi_cell(0, 6, clean_text(f"  {missing or 'None identified'}"))
-
-    pdf.ln(4)
-
-    # Strengths
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.set_text_color(200, 154, 240)
-    pdf.cell(0, 8, clean_text("Strengths"), ln=True)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(3)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(232, 234, 240)
-    for s in analysis.get("strengths", []):
-        pdf.cell(0, 7, clean_text(f"  [+]  {s}"), ln=True)
-
-    pdf.ln(4)
-
-    # Improvements
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.set_text_color(200, 154, 240)
-    pdf.cell(0, 8, clean_text("Improvement Recommendations"), ln=True)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(3)
-    icons = {"HIGH": "[HIGH]", "MEDIUM": "[MED]", "LOW": "[LOW]"}
-    pdf.set_font("Helvetica", "", 10)
-    for imp in analysis.get("improvements", []):
-        p = imp.get("priority", "MEDIUM")
-        if p == "HIGH":
-            pdf.set_text_color(220, 80, 100)
-        elif p == "MEDIUM":
-            pdf.set_text_color(220, 200, 70)
-        else:
-            pdf.set_text_color(100, 220, 80)
-        pdf.cell(20, 7, clean_text(f"  {icons.get(p, '')}"), ln=False)
-        pdf.set_text_color(232, 234, 240)
-        issue = clean_text(imp.get("issue", ""))
-        suggestion = clean_text(imp.get("suggestion", ""))
-        pdf.multi_cell(0, 7, f"{issue}  ->  {suggestion}")
-        pdf.ln(1)
-
-    # ── Page 2: Optimized CV ──
-    if opt_cv and not opt_cv.startswith("CV generation failed"):
-        pdf.add_page()
-        pdf.set_fill_color(15, 8, 59)
-        pdf.rect(0, 0, 210, 30, "F")
-        pdf.set_xy(10, 8)
-        pdf.set_font("Helvetica", "B", 20)
-        pdf.set_text_color(200, 154, 240)
-        pdf.cell(0, 14, clean_text("HireAi -- ATS-Optimized CV"), ln=True)
-
-        pdf.set_xy(10, 22)
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_text_color(112, 96, 160)
-        pdf.cell(0, 6, clean_text("AI-generated, keyword-optimized resume template"), ln=True)
-
-        pdf.ln(8)
-        pdf.set_font("Courier", "", 9)
-        pdf.set_text_color(220, 214, 240)
-        for line in opt_cv.split("\n"):
-            pdf.multi_cell(0, 5, clean_text(line))
-
+def _pdf_output(pdf: FPDF) -> bytes:
+    """Return PDF bytes, handling both fpdf v1 (str) and fpdf2 (bytearray)."""
     out = pdf.output(dest="S")
     if isinstance(out, str):
         return out.encode("latin-1")
@@ -656,14 +595,163 @@ def build_analysis_pdf(analysis: dict, opt_cv: str) -> bytes:
 
 
 # ─────────────────────────────────────────────
+# PDF EXPORT — SINGLE CANDIDATE
+# ─────────────────────────────────────────────
+def build_analysis_pdf(analysis: dict, opt_cv: str) -> bytes:
+    """
+    Generate a polished two-page PDF report:
+      Page 1 — full ATS analysis (scores, info, keywords, strengths, improvements)
+      Page 2 — ATS-optimised CV text (if available)
+
+    All text is passed through clean_text() for latin-1 safety.
+    Margins are set before add_page() to prevent FPDFException.
+    """
+    pdf, pw = _pdf_new()
+
+    # ── Page 1: Analysis Report ──────────────────────────────────────────────
+    pdf.add_page()
+    _pdf_page_header(
+        pdf, pw,
+        title="HireAi -- Resume Analysis Report",
+        subtitle=f"Generated: {datetime.now().strftime('%B %d, %Y at %H:%M')}",
+    )
+
+    # ── Candidate Profile ────────────────────────────────────────────────────
+    _pdf_section_header(pdf, pw, "Candidate Profile")
+    for label, key in [
+        ("Name", "candidate_name"), ("Email", "email"), ("Phone", "phone"),
+        ("Location", "location"), ("LinkedIn", "linkedin"),
+        ("Experience", "years_experience"),
+        ("Current Title", "current_title"), ("Education", "education"),
+    ]:
+        _pdf_kv_row(pdf, pw, label, analysis.get(key, "-"), lbl_w=55)
+
+    pdf.ln(4)
+
+    # ── ATS Score Summary ────────────────────────────────────────────────────
+    _pdf_section_header(pdf, pw, "ATS Score Summary")
+    for label, key in [
+        ("Overall ATS Score", "ats_score"),
+        ("Keyword Match", "keyword_match_score"),
+        ("Format Score", "format_score"),
+        ("Readability Score", "readability_score"),
+    ]:
+        _pdf_score_row(pdf, pw, label, analysis.get(key, 0))
+
+    pdf.ln(3)
+
+    # Recommendation line
+    pdf.set_x(pdf.l_margin)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(160, 200, 100)
+    rec = analysis.get("overall_recommendation", "")
+    pdf.cell(pw, 8, clean_text(f"  Recommendation: {rec}"), ln=True)
+
+    # Summary paragraph
+    pdf.set_x(pdf.l_margin)
+    pdf.set_font("Helvetica", "I", 10)
+    pdf.set_text_color(180, 170, 210)
+    _pdf_multiline(pdf, pw, analysis.get("summary", ""), h=5)
+
+    pdf.ln(4)
+
+    # ── Keyword Analysis ─────────────────────────────────────────────────────
+    _pdf_section_header(pdf, pw, "Keyword Analysis")
+
+    pdf.set_x(pdf.l_margin)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(100, 220, 80)
+    pdf.cell(pw, 7, clean_text("  Matched Keywords:"), ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(232, 234, 240)
+    matched = ", ".join(analysis.get("matched_keywords", []))
+    _pdf_multiline(pdf, pw, matched or "None identified.", h=5)
+
+    pdf.ln(2)
+    pdf.set_x(pdf.l_margin)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(220, 80, 100)
+    pdf.cell(pw, 7, clean_text("  Missing Keywords:"), ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(232, 234, 240)
+    missing = ", ".join(analysis.get("missing_keywords", []))
+    _pdf_multiline(pdf, pw, missing or "None identified.", h=5)
+
+    pdf.ln(4)
+
+    # ── Strengths ────────────────────────────────────────────────────────────
+    _pdf_section_header(pdf, pw, "Strengths")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(232, 234, 240)
+    for s in analysis.get("strengths", []):
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(pw, 7, clean_text(f"  [+]  {s}"), ln=True)
+
+    pdf.ln(4)
+
+    # ── Improvement Recommendations ──────────────────────────────────────────
+    _pdf_section_header(pdf, pw, "Improvement Recommendations")
+    icons = {"HIGH": "[HIGH]", "MEDIUM": "[MED]", "LOW": "[LOW]"}
+    icon_w = 22.0          # width reserved for the priority badge
+    text_w = pw - icon_w   # remaining width for issue + suggestion
+
+    for imp in analysis.get("improvements", []):
+        p = imp.get("priority", "MEDIUM")
+        # Priority badge (coloured, fixed width)
+        if p == "HIGH":
+            pdf.set_text_color(220, 80, 100)
+        elif p == "MEDIUM":
+            pdf.set_text_color(220, 200, 70)
+        else:
+            pdf.set_text_color(100, 220, 80)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(icon_w, 7, clean_text(f"  {icons.get(p, '')}"), ln=False)
+
+        # Issue + suggestion (wrapping, latin-1 safe, within remaining width)
+        pdf.set_text_color(232, 234, 240)
+        pdf.set_font("Helvetica", "", 9)
+        issue = imp.get("issue", "")
+        suggestion = imp.get("suggestion", "")
+        combined = clean_text(f"{issue}  ->  {suggestion}")
+        pdf.multi_cell(text_w, 7, combined)
+        pdf.ln(1)
+
+    # ── Page 2: Optimized CV (if available) ─────────────────────────────────
+    if opt_cv and not opt_cv.startswith("CV generation failed"):
+        pdf.add_page()
+        _pdf_page_header(
+            pdf, pw,
+            title="HireAi -- ATS-Optimized CV",
+            subtitle="AI-generated, keyword-optimized resume template",
+        )
+        pdf.set_font("Courier", "", 9)
+        pdf.set_text_color(220, 214, 240)
+        for line in opt_cv.split("\n"):
+            # Use multi_cell per line so very long lines wrap cleanly
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(pw, 5, clean_text(line))
+
+    return _pdf_output(pdf)
+
+
+# ─────────────────────────────────────────────
 # PDF EXPORT — BATCH TOP-3 MERGED REPORT
 # ─────────────────────────────────────────────
 def build_batch_pdf(batch_results: list, jd_title: str) -> bytes:
-    """Generate a merged PDF report for the top 3 candidates from a batch."""
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
+    """
+    Generate a merged PDF report for the top 3 candidates from a batch run.
+    One page per candidate, sorted by ATS score descending.
+    """
+    pdf, pw = _pdf_new()
 
-    top3 = sorted(batch_results, key=lambda x: x["analysis"].get("ats_score", 0), reverse=True)[:3]
+    top3 = sorted(
+        batch_results,
+        key=lambda x: x["analysis"].get("ats_score", 0),
+        reverse=True,
+    )[:3]
+
+    total = len(batch_results)
 
     for rank, item in enumerate(top3, 1):
         analysis = item["analysis"]
@@ -671,119 +759,83 @@ def build_batch_pdf(batch_results: list, jd_title: str) -> bytes:
 
         pdf.add_page()
 
-        # Header
-        pdf.set_fill_color(15, 8, 59)
-        pdf.rect(0, 0, 210, 30, "F")
-        pdf.set_xy(10, 8)
-        pdf.set_font("Helvetica", "B", 18)
-        pdf.set_text_color(200, 154, 240)
         badge = " [TOP PICK]" if rank == 1 else f" [#{rank}]"
-        pdf.cell(0, 14, clean_text(f"HireAi Batch Report{badge}"), ln=True)
+        role_line = (
+            f"Role: {jd_title or 'N/A'}  |  File: {filename}  |  "
+            f"Rank: #{rank} of {total}"
+        )
+        _pdf_page_header(
+            pdf, pw,
+            title=f"HireAi Batch Report{badge}",
+            subtitle=role_line,
+        )
 
-        pdf.set_xy(10, 22)
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_text_color(112, 96, 160)
-        pdf.cell(0, 6, clean_text(
-            f"Role: {jd_title or 'N/A'}  |  File: {filename}  |  Rank: #{rank} of {len(batch_results)}"
-        ), ln=True)
-
-        pdf.ln(8)
-
-        # Candidate info
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.set_text_color(200, 154, 240)
-        pdf.cell(0, 8, clean_text("Candidate Profile"), ln=True)
-        pdf.set_draw_color(84, 22, 181)
-        pdf.set_line_width(0.4)
-        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-        pdf.ln(3)
-
-        fields = [
+        # ── Candidate Profile ────────────────────────────────────────────────
+        _pdf_section_header(pdf, pw, "Candidate Profile")
+        for label, key in [
             ("Name", "candidate_name"), ("Email", "email"), ("Phone", "phone"),
             ("Location", "location"), ("Experience", "years_experience"),
             ("Title", "current_title"), ("Education", "education"),
-        ]
-        pdf.set_font("Helvetica", "", 10)
-        for label, key in fields:
-            val = analysis.get(key, "-") or "-"
-            pdf.set_text_color(112, 96, 160)
-            pdf.cell(45, 7, clean_text(f"  {label}:"), ln=False)
-            pdf.set_text_color(232, 234, 240)
-            pdf.cell(0, 7, clean_text(str(val)), ln=True)
-
-        pdf.ln(4)
-
-        # Scores
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.set_text_color(200, 154, 240)
-        pdf.cell(0, 8, clean_text("ATS Scores"), ln=True)
-        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-        pdf.ln(3)
-
-        for label, key in [
-            ("Overall ATS", "ats_score"), ("Keyword Match", "keyword_match_score"),
-            ("Format", "format_score"), ("Readability", "readability_score"),
         ]:
-            val = analysis.get(key, 0)
-            pdf.set_font("Helvetica", "", 10)
-            pdf.set_text_color(112, 96, 160)
-            pdf.cell(70, 7, clean_text(f"  {label}"), ln=False)
-            if val >= 75:
-                pdf.set_text_color(100, 220, 80)
-            elif val >= 50:
-                pdf.set_text_color(220, 200, 70)
-            else:
-                pdf.set_text_color(220, 80, 100)
-            pdf.cell(0, 7, clean_text(f"{val} / 100"), ln=True)
+            _pdf_kv_row(pdf, pw, label, analysis.get(key, "-"), lbl_w=48)
 
         pdf.ln(3)
+
+        # ── ATS Scores ───────────────────────────────────────────────────────
+        _pdf_section_header(pdf, pw, "ATS Scores")
+        for label, key in [
+            ("Overall ATS Score", "ats_score"),
+            ("Keyword Match", "keyword_match_score"),
+            ("Format Score", "format_score"),
+            ("Readability Score", "readability_score"),
+        ]:
+            _pdf_score_row(pdf, pw, label, analysis.get(key, 0), lbl_w=85)
+
+        pdf.ln(2)
+
+        # Recommendation
+        pdf.set_x(pdf.l_margin)
         pdf.set_font("Helvetica", "B", 10)
         pdf.set_text_color(160, 200, 100)
-        pdf.cell(0, 7, clean_text(f"  Recommendation: {analysis.get('overall_recommendation', '')}"), ln=True)
+        pdf.cell(pw, 7, clean_text(f"  Recommendation: {analysis.get('overall_recommendation', '')}"), ln=True)
 
+        # Summary
         pdf.set_font("Helvetica", "I", 9)
         pdf.set_text_color(180, 170, 210)
-        pdf.multi_cell(0, 5, clean_text(f"  {analysis.get('summary', '')}"))
+        _pdf_multiline(pdf, pw, analysis.get("summary", ""), h=5)
 
         pdf.ln(3)
 
-        # Skills
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.set_text_color(200, 154, 240)
-        pdf.cell(0, 7, clean_text("Skills"), ln=True)
-        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-        pdf.ln(2)
+        # ── Skills ───────────────────────────────────────────────────────────
+        _pdf_section_header(pdf, pw, "Skills")
         pdf.set_font("Helvetica", "", 10)
         pdf.set_text_color(232, 234, 240)
         skills_str = ", ".join(analysis.get("skills", []))
-        pdf.multi_cell(0, 6, clean_text(f"  {skills_str or 'None extracted'}"))
+        _pdf_multiline(pdf, pw, skills_str or "None extracted.", h=5)
 
         pdf.ln(3)
 
-        # Top improvements
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.set_text_color(200, 154, 240)
-        pdf.cell(0, 7, clean_text("Key Improvement Areas"), ln=True)
-        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-        pdf.ln(2)
+        # ── Key Improvement Areas (top 3) ────────────────────────────────────
+        _pdf_section_header(pdf, pw, "Key Improvement Areas")
+        text_w = pw - 22.0   # 22 mm icon column
         pdf.set_font("Helvetica", "", 9)
         for imp in analysis.get("improvements", [])[:3]:
-            p = imp.get("priority", "")
+            p = imp.get("priority", "MEDIUM")
             if p == "HIGH":
                 pdf.set_text_color(220, 80, 100)
             elif p == "MEDIUM":
                 pdf.set_text_color(220, 200, 70)
             else:
                 pdf.set_text_color(100, 220, 80)
-            issue = clean_text(imp.get("issue", ""))
-            sug = clean_text(imp.get("suggestion", ""))
-            pdf.multi_cell(0, 5, f"  [{p}] {issue} -> {sug}")
+            pdf.set_x(pdf.l_margin)
+            pdf.cell(22, 5, clean_text(f"  [{p}]"), ln=False)
+            pdf.set_text_color(232, 234, 240)
+            issue = imp.get("issue", "")
+            sug = imp.get("suggestion", "")
+            pdf.multi_cell(text_w, 5, clean_text(f"{issue} -> {sug}"))
             pdf.ln(1)
 
-    out = pdf.output(dest="S")
-    if isinstance(out, str):
-        return out.encode("latin-1")
-    return bytes(out)
+    return _pdf_output(pdf)
 
 
 # ─────────────────────────────────────────────
@@ -803,7 +855,7 @@ def build_batch_csv(batch_results: list) -> bytes:
     sorted_results = sorted(
         batch_results,
         key=lambda x: x["analysis"].get("ats_score", 0),
-        reverse=True
+        reverse=True,
     )
     for rank, item in enumerate(sorted_results, 1):
         a = item["analysis"]
@@ -828,9 +880,11 @@ def build_batch_csv(batch_results: list) -> bytes:
 # ─────────────────────────────────────────────
 # RENDER: SINGLE ANALYSIS RESULTS
 # ─────────────────────────────────────────────
-def render_single_results(analysis: dict, resume_text: str, jd_text: str, jd_title: str):
+def render_single_results(analysis: dict, resume_text: str,
+                           jd_text: str, jd_title: str):
     """Render the full results panel for a single resume analysis."""
-    # ── Scores ──
+
+    # ── Scores ──────────────────────────────────────────────────────────────
     st.markdown('<div class="sec-header">🎯 ATS Scores</div>', unsafe_allow_html=True)
     s1, s2, s3, s4 = st.columns(4)
     for col, lbl, key in [
@@ -862,7 +916,7 @@ def render_single_results(analysis: dict, resume_text: str, jd_text: str, jd_tit
     )
     st.markdown(f"> {analysis.get('summary', '')}")
 
-    # ── Candidate Info ──
+    # ── Candidate Info ───────────────────────────────────────────────────────
     st.markdown('<div class="sec-header">👤 Candidate Info</div>', unsafe_allow_html=True)
     ci1, ci2 = st.columns(2)
     info_fields = [
@@ -875,29 +929,35 @@ def render_single_results(analysis: dict, resume_text: str, jd_text: str, jd_tit
         v = analysis.get(k, "—") or "—"
         (ci1 if i % 2 == 0 else ci2).markdown(f"**{lbl}:** {v}")
 
-    # ── Skills ──
+    # ── Skills ───────────────────────────────────────────────────────────────
     st.markdown('<div class="sec-header">🛠 Skills</div>', unsafe_allow_html=True)
     skills_html = " ".join(f'<span class="tag">{s}</span>' for s in analysis.get("skills", []))
     st.markdown(skills_html or "No skills extracted.", unsafe_allow_html=True)
 
-    # ── Keywords ──
+    # ── Keywords ─────────────────────────────────────────────────────────────
     st.markdown('<div class="sec-header">🔑 Keyword Analysis</div>', unsafe_allow_html=True)
     kw1, kw2 = st.columns(2)
     with kw1:
         st.markdown("**✅ Matched Keywords**")
-        matched_html = " ".join(f'<span class="tag">{k}</span>' for k in analysis.get("matched_keywords", []))
+        matched_html = " ".join(
+            f'<span class="tag">{k}</span>'
+            for k in analysis.get("matched_keywords", [])
+        )
         st.markdown(matched_html or "None identified.", unsafe_allow_html=True)
     with kw2:
         st.markdown("**❌ Missing Keywords**")
-        miss_html = " ".join(f'<span class="tag tag-miss">{k}</span>' for k in analysis.get("missing_keywords", []))
+        miss_html = " ".join(
+            f'<span class="tag tag-miss">{k}</span>'
+            for k in analysis.get("missing_keywords", [])
+        )
         st.markdown(miss_html or "None identified.", unsafe_allow_html=True)
 
-    # ── Strengths ──
+    # ── Strengths ────────────────────────────────────────────────────────────
     st.markdown('<div class="sec-header">💪 Strengths</div>', unsafe_allow_html=True)
     for s in analysis.get("strengths", []):
         st.markdown(f"✅ {s}")
 
-    # ── Improvements ──
+    # ── Improvements ─────────────────────────────────────────────────────────
     st.markdown('<div class="sec-header">🔧 Improvements</div>', unsafe_allow_html=True)
     icons = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
     for imp in analysis.get("improvements", []):
@@ -909,15 +969,22 @@ def render_single_results(analysis: dict, resume_text: str, jd_text: str, jd_tit
             unsafe_allow_html=True,
         )
 
-    # ── Optimized CV ──
+    # ── Optimized CV (cached in session state to avoid re-calling the API) ──
     st.markdown('<div class="sec-header">📝 ATS-Optimized CV</div>', unsafe_allow_html=True)
-    with st.spinner("✍️ Generating optimized CV…"):
-        opt_cv = gen_cv(resume_text, jd_text, analysis)
+
+    # Only regenerate if we don't already have a CV cached for this analysis
+    if not st.session_state.last_single_opt_cv:
+        with st.spinner("✍️ Generating optimized CV…"):
+            opt_cv = gen_cv(resume_text, jd_text, analysis)
+        st.session_state.last_single_opt_cv = opt_cv
+    else:
+        opt_cv = st.session_state.last_single_opt_cv
 
     st.text_area("ATS-Optimized CV (copy or download)", opt_cv, height=400)
 
-    # ── PDF Export ──
+    # ── Export ───────────────────────────────────────────────────────────────
     st.markdown('<div class="sec-header">📄 Export</div>', unsafe_allow_html=True)
+
     with st.spinner("📑 Building PDF report…"):
         pdf_bytes = build_analysis_pdf(analysis, opt_cv)
 
@@ -946,7 +1013,10 @@ def render_single_results(analysis: dict, resume_text: str, jd_text: str, jd_tit
 # ─────────────────────────────────────────────
 def render_batch_dashboard(batch_results: list, jd_title: str):
     """Render the sortable comparison table and batch export controls."""
-    st.markdown('<div class="sec-header">👥 Candidate Comparison Dashboard</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sec-header">👥 Candidate Comparison Dashboard</div>',
+        unsafe_allow_html=True,
+    )
 
     if not batch_results:
         st.info("No batch results to display.")
@@ -955,7 +1025,7 @@ def render_batch_dashboard(batch_results: list, jd_title: str):
     sorted_results = sorted(
         batch_results,
         key=lambda x: x["analysis"].get("ats_score", 0),
-        reverse=True
+        reverse=True,
     )
     top_score = sorted_results[0]["analysis"].get("ats_score", 0) if sorted_results else 0
 
@@ -979,7 +1049,6 @@ def render_batch_dashboard(batch_results: list, jd_title: str):
 
     df = pd.DataFrame(rows)
 
-    # Display sortable dataframe
     st.dataframe(
         df,
         use_container_width=True,
@@ -995,7 +1064,7 @@ def render_batch_dashboard(batch_results: list, jd_title: str):
         },
     )
 
-    # Top pick highlight
+    # Top pick highlight card
     if sorted_results:
         top = sorted_results[0]
         ta = top["analysis"]
@@ -1004,7 +1073,7 @@ def render_batch_dashboard(batch_results: list, jd_title: str):
             f'<span class="top-pick-badge">⭐ TOP PICK</span>'
             f'<h3 style="margin-top:10px">{ta.get("candidate_name", top["filename"])}</h3>'
             f'<p style="color:#A090C0">{ta.get("current_title", "")} &nbsp;|&nbsp; '
-            f'ATS Score: <span style="color:{score_color(ta.get("ats_score",0))};font-weight:700">'
+            f'ATS Score: <span style="color:{score_color(ta.get("ats_score", 0))};font-weight:700">'
             f'{ta.get("ats_score", 0)}</span></p>'
             f'<p style="color:#C89AF0">{ta.get("summary", "")}</p>'
             f'</div>',
@@ -1012,7 +1081,10 @@ def render_batch_dashboard(batch_results: list, jd_title: str):
         )
 
     # Expandable detail per candidate
-    st.markdown('<div class="sec-header">📋 Individual Candidate Details</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sec-header">📋 Individual Candidate Details</div>',
+        unsafe_allow_html=True,
+    )
     for rank, item in enumerate(sorted_results, 1):
         a = item["analysis"]
         name = a.get("candidate_name", item["filename"]) or item["filename"]
@@ -1028,7 +1100,10 @@ def render_batch_dashboard(batch_results: list, jd_title: str):
             st.markdown(f"**Recommendation:** {a.get('overall_recommendation', '')}")
             st.markdown(f"> {a.get('summary', '')}")
 
-            skills_html = " ".join(f'<span class="tag">{s}</span>' for s in a.get("skills", []))
+            skills_html = " ".join(
+                f'<span class="tag">{s}</span>'
+                for s in a.get("skills", [])
+            )
             st.markdown("**Skills:**")
             st.markdown(skills_html or "None", unsafe_allow_html=True)
 
@@ -1100,7 +1175,10 @@ def render_sidebar():
                         st.error("Email already registered.")
 
             st.markdown('<div class="purple-divider"></div>', unsafe_allow_html=True)
-            st.info("Sign in to save analysis history, track job applications, and export PDF reports.")
+            st.info(
+                "Sign in to save analysis history, track job applications, "
+                "and export PDF reports."
+            )
 
         else:
             st.markdown(
@@ -1150,12 +1228,13 @@ def render_sidebar():
 def render_analyzer():
     st.markdown('<div class="brand-header">🔮 HireAi</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="brand-sub">ATS scoring · keyword gap analysis · CV optimization · PDF export · Batch processing</div>',
+        '<div class="brand-sub">ATS scoring · keyword gap analysis · '
+        'CV optimization · PDF export · Batch processing</div>',
         unsafe_allow_html=True,
     )
     st.markdown('<div class="purple-divider"></div>', unsafe_allow_html=True)
 
-    # ── Mode Toggle ──
+    # ── Mode Toggle ──────────────────────────────────────────────────────────
     mode = st.radio(
         "**Processing Mode**",
         ["📄 Single Resume", "📦 Batch / ZIP"],
@@ -1165,7 +1244,7 @@ def render_analyzer():
 
     st.markdown('<div class="purple-divider"></div>', unsafe_allow_html=True)
 
-    # ── Job Description (shared for both modes) ──
+    # ── Job Description (shared) ─────────────────────────────────────────────
     st.markdown('<div class="sec-header">📝 Job Description</div>', unsafe_allow_html=True)
     jd_col1, jd_col2 = st.columns([1, 2])
     with jd_col1:
@@ -1194,9 +1273,9 @@ def render_analyzer():
 
     st.markdown('<div class="purple-divider"></div>', unsafe_allow_html=True)
 
-    # ══════════════════════════════════════════
+    # ════════════════════════════════════════════
     # SINGLE RESUME MODE
-    # ══════════════════════════════════════════
+    # ════════════════════════════════════════════
     if mode == "📄 Single Resume":
         st.markdown('<div class="sec-header">📤 Upload Resume</div>', unsafe_allow_html=True)
         uploaded = st.file_uploader(
@@ -1221,17 +1300,23 @@ def render_analyzer():
                 resume_text = extract_text(file_bytes, uploaded.name)
 
             if len(resume_text.strip()) < 50:
-                st.error("Could not extract text — is the PDF a scanned image? Try a text-based PDF or DOCX.")
+                st.error(
+                    "Could not extract text — is the PDF a scanned image? "
+                    "Try a text-based PDF or DOCX."
+                )
                 return
 
             with st.spinner("🤖 Analyzing with LLaMA 3.3-70B…"):
                 analysis = analyze_resume(resume_text, jd_text)
 
             if not analysis:
-                st.error("Analysis failed. Please check your GROQ_API_KEY in Streamlit secrets and retry.")
+                st.error(
+                    "Analysis failed. Please check your GROQ_API_KEY in "
+                    "Streamlit secrets and retry."
+                )
                 return
 
-            # Store in history and session
+            # Save to history
             if st.session_state.logged_in:
                 st.session_state.analysis_history.append({
                     "date": datetime.now().strftime("%b %d, %Y %H:%M"),
@@ -1241,24 +1326,32 @@ def render_analyzer():
                     "data": analysis,
                 })
 
+            # Cache in session state; clear old CV so a fresh one is generated
             st.session_state.last_single_analysis = analysis
             st.session_state.last_single_resume_text = resume_text
             st.session_state.last_single_jd_title = jd_title
+            st.session_state.last_single_jd_text = jd_text
+            st.session_state.last_single_opt_cv = ""   # reset so CV regenerates
 
         # Render results if available
         if st.session_state.last_single_analysis:
             render_single_results(
                 st.session_state.last_single_analysis,
                 st.session_state.last_single_resume_text,
-                jd_text,
+                # Use the stored JD text so the CV doesn't regenerate if the
+                # textarea changes between reruns
+                st.session_state.last_single_jd_text or jd_text,
                 st.session_state.last_single_jd_title,
             )
 
-    # ══════════════════════════════════════════
+    # ════════════════════════════════════════════
     # BATCH / ZIP MODE
-    # ══════════════════════════════════════════
+    # ════════════════════════════════════════════
     else:
-        st.markdown('<div class="sec-header">📦 Upload Resumes (ZIP or Multiple Files)</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="sec-header">📦 Upload Resumes (ZIP or Multiple Files)</div>',
+            unsafe_allow_html=True,
+        )
         st.caption(
             "Upload a single ZIP archive containing PDF/DOCX/TXT resumes, "
             "or select multiple individual files at once."
@@ -1272,7 +1365,9 @@ def render_analyzer():
             key="batch_uploader",
         )
 
-        run_batch = st.button("🚀 Analyze All Resumes", use_container_width=True, key="batch_run")
+        run_batch = st.button(
+            "🚀 Analyze All Resumes", use_container_width=True, key="batch_run"
+        )
 
         if run_batch:
             if not batch_upload:
@@ -1283,7 +1378,7 @@ def render_analyzer():
                 return
 
             # Collect all files to analyze
-            files_to_analyze = []  # list of {filename, text}
+            files_to_analyze = []
 
             for uploaded_file in batch_upload:
                 raw = uploaded_file.read()
@@ -1295,53 +1390,67 @@ def render_analyzer():
                 else:
                     text = extract_text(raw, uploaded_file.name)
                     if len(text.strip()) >= 50:
-                        files_to_analyze.append({"filename": uploaded_file.name, "text": text})
+                        files_to_analyze.append(
+                            {"filename": uploaded_file.name, "text": text}
+                        )
                     else:
-                        st.warning(f"⚠️ Skipped {uploaded_file.name} — could not extract sufficient text.")
+                        st.warning(
+                            f"⚠️ Skipped {uploaded_file.name} — "
+                            "could not extract sufficient text."
+                        )
 
             if not files_to_analyze:
-                st.error("No valid resume text found in uploaded files. Check that files are text-based PDFs or DOCX.")
+                st.error(
+                    "No valid resume text found in uploaded files. "
+                    "Check that files are text-based PDFs or DOCX."
+                )
                 return
 
-            st.info(f"📂 Found **{len(files_to_analyze)}** resume(s) to analyze. Starting batch processing…")
+            st.info(
+                f"📂 Found **{len(files_to_analyze)}** resume(s) to analyze. "
+                "Starting batch processing…"
+            )
 
             progress_bar = st.progress(0, text="Initializing…")
             batch_results = []
             errors = 0
 
             for idx, file_item in enumerate(files_to_analyze):
-                progress_fraction = idx / len(files_to_analyze)
                 progress_bar.progress(
-                    progress_fraction,
-                    text=f"Analyzing {idx + 1}/{len(files_to_analyze)}: {file_item['filename']}…"
+                    idx / len(files_to_analyze),
+                    text=f"Analyzing {idx + 1}/{len(files_to_analyze)}: "
+                         f"{file_item['filename']}…",
                 )
-
                 analysis = analyze_resume(file_item["text"], jd_text)
-
                 if analysis:
                     batch_results.append({
                         "filename": file_item["filename"],
                         "analysis": analysis,
                     })
-                    # Save each to history
                     if st.session_state.logged_in:
                         st.session_state.analysis_history.append({
                             "date": datetime.now().strftime("%b %d, %Y %H:%M"),
-                            "name": analysis.get("candidate_name", file_item["filename"]),
+                            "name": analysis.get(
+                                "candidate_name", file_item["filename"]
+                            ),
                             "ats": analysis.get("ats_score", 0),
                             "jd_title": jd_title or "Batch Analysis",
                             "data": analysis,
                         })
                 else:
                     errors += 1
-                    st.warning(f"⚠️ Analysis failed for {file_item['filename']} — skipped.")
+                    st.warning(
+                        f"⚠️ Analysis failed for {file_item['filename']} — skipped."
+                    )
 
             progress_bar.progress(1.0, text="✅ Batch analysis complete!")
-
             st.session_state.batch_results = batch_results
 
             if errors:
-                st.warning(f"{errors} file(s) failed to analyze. Results below show successful analyses only.")
+                st.warning(
+                    f"{errors} file(s) failed to analyze. "
+                    "Results below show successful analyses only."
+                )
 
         # Render batch dashboard if results exist
         if st.session_state.batch_results:
@@ -1353,7 +1462,10 @@ def render_analyzer():
 # ─────────────────────────────────────────────
 def render_dashboard():
     st.markdown('<div class="brand-header">📊 Dashboard</div>', unsafe_allow_html=True)
-    st.markdown('<div class="brand-sub">Track your ATS performance over time</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="brand-sub">Track your ATS performance over time</div>',
+        unsafe_allow_html=True,
+    )
     st.markdown('<div class="purple-divider"></div>', unsafe_allow_html=True)
 
     hist = st.session_state.analysis_history
@@ -1405,7 +1517,10 @@ def render_dashboard():
 
     if len(hist) >= 3:
         latest = hist[-1]
-        st.markdown('<div class="sec-header">📊 Score Breakdown (Latest Analysis)</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="sec-header">📊 Score Breakdown (Latest Analysis)</div>',
+            unsafe_allow_html=True,
+        )
         latest_data = latest["data"]
         score_df = pd.DataFrame({
             "Category": ["ATS Score", "Keyword Match", "Format", "Readability"],
@@ -1432,7 +1547,10 @@ def render_saved_jobs():
 
     jobs = st.session_state.saved_jobs
     if not jobs:
-        st.info("No saved jobs yet. Paste a job description in the **Analyzer** tab and click **Save This Job**.")
+        st.info(
+            "No saved jobs yet. Paste a job description in the **Analyzer** tab "
+            "and click **Save This Job**."
+        )
         return
 
     st.markdown(f"**{len(jobs)} saved position{'s' if len(jobs) != 1 else ''}**")
@@ -1440,8 +1558,14 @@ def render_saved_jobs():
 
     for i, job in enumerate(jobs):
         with st.expander(f"🏢 {job['title']} — saved {job['saved_at']}"):
-            st.markdown(f'<div class="job-card-meta">Saved on {job["saved_at"]}</div>', unsafe_allow_html=True)
-            st.text_area("Job Description", job["jd"], height=200, key=f"jd_view_{i}", disabled=True)
+            st.markdown(
+                f'<div class="job-card-meta">Saved on {job["saved_at"]}</div>',
+                unsafe_allow_html=True,
+            )
+            st.text_area(
+                "Job Description", job["jd"], height=200,
+                key=f"jd_view_{i}", disabled=True,
+            )
 
             related = [
                 h for h in st.session_state.analysis_history
@@ -1453,7 +1577,8 @@ def render_saved_jobs():
                     c1, c2, c3 = st.columns([3, 1, 2])
                     c1.markdown(f"📄 {r['name']}")
                     c2.markdown(
-                        f'<span style="color:{score_color(r["ats"])};font-weight:700">{r["ats"]} ATS</span>',
+                        f'<span style="color:{score_color(r["ats"])};font-weight:700">'
+                        f'{r["ats"]} ATS</span>',
                         unsafe_allow_html=True,
                     )
                     c3.markdown(f"<small>{r['date']}</small>", unsafe_allow_html=True)
