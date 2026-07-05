@@ -3,6 +3,8 @@
 **HireAi** is a production-ready SaaS application that gives job seekers a deep, AI-powered analysis of their resume against any job description. It surfaces ATS compatibility scores, identifies keyword gaps, generates an optimized CV, and exports a polished PDF report — all powered by LLaMA 3.3-70B via Groq Cloud.
 
 ---
+#▶️Live Demo App 👇
+https://itld2rautsq8bweuyrlpbd.streamlit.app/
 
 ## ✨ Features
 
