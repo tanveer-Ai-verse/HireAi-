@@ -647,7 +647,7 @@ def build_analysis_pdf(analysis: dict, opt_cv: str) -> bytes:
         pdf.set_font("Courier", "", 9)
         pdf.set_text_color(220, 214, 240)
         for line in opt_cv.split("\n"):
-            pdf.multi_cell(0, 5, clean_text(line))
+            pdf.multi_cell(0, 5, clean_text(line)[:200])  # truncate all lines to 200 chars
 
     out = pdf.output(dest="S")
     if isinstance(out, str):
