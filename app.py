@@ -917,29 +917,44 @@ def render_single_results(analysis: dict, resume_text: str, jd_text: str, jd_tit
     st.text_area("ATS-Optimized CV (copy or download)", opt_cv, height=400)
 
     # ── PDF Export ──
-    st.markdown('<div class="sec-header">📄 Export</div>', unsafe_allow_html=True)
-    with st.spinner("📑 Building PDF report…"):
-        pdf_bytes = build_analysis_pdf(analysis, opt_cv)
+    def build_analysis_pdf(analysis, opt_cv):
+    from fpdf import FPDF
+    import io
 
-    fname = (analysis.get("candidate_name", "candidate") or "candidate").replace(" ", "_")
-    dl1, dl2 = st.columns(2)
-    dl1.download_button(
-        "⬇️ Download PDF Report",
-        data=pdf_bytes,
-        file_name=f"hireai_report_{fname}.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-    )
-    dl2.download_button(
-        "⬇️ Download Optimized CV (.txt)",
-        data=opt_cv.encode("utf-8"),
-        file_name=f"hireai_cv_{fname}.txt",
-        mime="text/plain",
-        use_container_width=True,
-    )
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=10)
+    
+    # Ensure margins are defined so multi_cell has a boundary
+    pdf.set_margins(15, 15, 15)
+    
+    # Helper to clean text for FPDF compatibility
+    def format_line(text):
+        # Encode to latin-1 to avoid non-standard character issues, 
+        # replacing unknown chars with '?'
+        return str(text).encode('latin-1', 'replace').decode('latin-1')
 
-    st.success("✅ Analysis complete! Download your PDF report or copy the optimized CV above.")
+    # Convert the analysis dict to a readable string format
+    content = f"Candidate: {analysis.get('candidate_name', 'N/A')}\n\n"
+    content += f"Summary:\n{analysis.get('recommendation', 'N/A')}\n\n"
+    content += f"Strengths:\n{analysis.get('strengths', 'N/A')}\n\n"
+    content += f"Improvements:\n{analysis.get('improvements', 'N/A')}\n\n"
+    content += "--- OPTIMIZED CV ---\n"
+    content += opt_cv
 
+    # Use multi_cell with an explicit width calculation to prevent overflow
+    # 'w=0' means reach the right margin
+    for line in content.split('\n'):
+        clean_str = format_line(line)
+        # Only process if line is not empty to avoid unnecessary breaks
+        if clean_str.strip():
+            # We use 5 as height. If this still fails, ensure font size 
+            # is small enough for the margin space
+            pdf.multi_cell(0, 5, clean_str)
+        else:
+            pdf.ln(5)
+
+    return pdf.output(dest='S').encode('latin-1')
 
 # ─────────────────────────────────────────────
 # RENDER: BATCH COMPARISON DASHBOARD
